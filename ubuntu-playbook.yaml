@@ -1,0 +1,224 @@
+- name: Ansible Playbook to Install and Setup Apache on Ubuntu
+  hosts: webserver
+  become: yes
+  vars:
+    DB_CONNECTION: pgsql
+    DB_DATABASE: laraveldb
+    DB_USERNAME: laravel
+    DB_PASSWORD: 4OFxc3t2bLS24OOkfpn
+    DB_HOST: localhost
+    DB_PORT: 5432
+    # This should be the domain name of your server
+    # It should be added after pointing the domain name to the server
+    # If you are using a subdomain, then it should be the subdomain
+    # If not, take it out and leave it blank
+    http_host: ansible.shadowinc.xyz
+    email: test@shadowinc.xyz
+
+  # These are handlers that can be called from anywhere in the playbook
+  handlers:
+    - name: restart-apache
+      service:
+        name: apache2
+        state: restarted
+
+  # These are the tasks that will be executed in order
+  tasks:
+    - name: Install required packaged
+      apt:
+        name: "{{ item }}"
+        state: latest
+      with_items:
+        - acl
+
+    - name: Get list of installed binaries
+      command: ls /usr/local/bin
+      register: local_binaries
+
+    - name: Install latest version of Apache
+      apt: name=apache2 update_cache=yes state=latest
+
+    - name: Install php and necessary modules
+      apt: name={{ item }} state=latest
+      with_items:
+        - php 
+        - libapache2-mod-php 
+        - php-mbstring 
+        - php-xmlrpc 
+        - php-soap 
+        - php-gd 
+        - php-xml 
+        - php-cli 
+        - php-zip 
+        - php-bcmath 
+        - php-tokenizer 
+        - php-json 
+        - php-pear 
+        - php-curl 
+        - php-intl
+        - php-pgsql
+
+    - name: Install Composer
+      when: "local_binaries.stdout.find('composer') == -1"
+      shell: |
+        php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+        php -r "if (hash_file('sha384', 'composer-setup.php') === '55ce33d7678c5a611085589f1f3ddf8b3c52d662cd01d4ba75c0ee0459970c2200a51f492d557530c71c15d8dba01eae') { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;"
+        php composer-setup.php
+        php -r "unlink('composer-setup.php');"
+        sudo mv composer.phar /usr/local/bin/composer
+      args:
+        chdir: /tmp
+      
+    - name: Install Postgres and necessary modules
+      apt: name={{ item }} state=latest
+      with_items:
+        - postgresql
+        - postgresql-contrib
+        - postgresql-client
+
+    - name: "Start and enable services"
+      service: "name={{ item }} state=started enabled=yes"
+      with_items:
+        - postgresql
+
+    - name: Copy Database Setup Script
+      copy:
+        src: files/db-setup.sh
+        dest: /tmp/db-setup.sh
+        mode: 0755
+
+    - name: Run Database Setup Script
+      become: yes
+      become_user: postgres
+      shell: ./db-setup.sh
+      args:
+        chdir: /tmp
+      environment:
+        DB_DATABASE: "{{ DB_DATABASE }}"
+        DB_USERNAME: "{{ DB_USERNAME }}"
+        DB_PASSWORD: "{{ DB_PASSWORD }}"
+      register: db_setup
+
+    - name: Output Database Setup Script Output
+      debug:
+        var: db_setup.stdout_lines
+
+    - name: Enable Apache mod_rewrite
+      apache2_module: name=rewrite state=present
+
+    - name: Add a setting to ~/.gitconfig
+      community.general.git_config:
+        name: safe.directory
+        scope: global
+        value: /var/www/html/laravel-realworld-example-app
+
+    - name: Clone the project from Github
+      git:
+        repo: https://github.com/f1amy/laravel-realworld-example-app.git
+        dest: /var/www/html/laravel-realworld-example-app
+        force: yes
+        clone: yes
+        update: yes
+
+    - name: Setup .env file
+      template:
+        src: files/.env.j2
+        dest: /var/www/html/laravel-realworld-example-app/.env
+        mode: 0644
+
+    - name: Install Laravel dependencies
+      composer:
+        command: install
+        working_dir: /var/www/html/laravel-realworld-example-app
+      environment:
+        COMPOSER_NO_INTERACTION: "1"
+        COMPOSER_ALLOW_SUPERUSER: "1"
+
+    - name: change owner of the project to www-data
+      file:
+        path: /var/www/html/laravel-realworld-example-app
+        owner: www-data
+        group: www-data
+        recurse: yes
+
+    - name: Change storage directory permissions
+      file:
+        path: /var/www/html/laravel-realworld-example-app/storage
+        mode: 0777
+        recurse: yes
+
+    - name: Change bootstrap/cache directory permissions
+      file:
+        path: /var/www/html/laravel-realworld-example-app/bootstrap/cache
+        mode: 0777
+        recurse: yes
+
+    - name: Disable default Apache site
+      command: a2dissite 000-default.conf
+      notify: restart-apache
+
+    - name: Copy the Apache configuration file without ssl
+      template:
+        src: files/laravel-realworld-example-app-default.conf
+        dest: /etc/apache2/sites-available/laravel-realworld-example-app.conf
+
+    - name: Enable the new Apache site
+      command: a2ensite laravel-realworld-example-app.conf
+      notify: restart-apache
+
+    - name: Run Laravel migrations
+      shell: php artisan migrate
+      args:
+        chdir: /var/www/html/laravel-realworld-example-app
+
+    # Everything below this line is for SSL configuration
+    # http_host should be set for this to work
+    - name: Snap Install and Refresh Core
+      snap:
+        name: core
+        state: present
+
+    - name: Remove Certbot if installed from apt
+      apt:
+        name: certbot
+        state: absent
+
+    - name: Install Certbot with Snap
+      snap:
+        name: certbot
+        classic: yes
+
+    - name: Create Softlink for Certbot
+      file:
+        src: /snap/bin/certbot
+        dest: /usr/bin/certbot
+        state: link
+
+    - name: Copy the Apache configuration file with ssl
+      when: http_host is defined
+      template:
+        src: files/laravel-realworld-example-app-ssl.conf
+        dest: /etc/apache2/sites-available/laravel-realworld-example-app.conf
+
+    - name: Enable the new Apache site
+      when: http_host is defined
+      command: a2ensite laravel-realworld-example-app.conf
+      notify: restart-apache
+
+    - name: Stop Apache
+      when: http_host is defined
+      service:
+        name: apache2
+        state: stopped
+
+    - name: Create Certificates
+      become: yes
+      shell: certbot --apache -d {{ http_host }} -n -m {{ email }} --agree-tos
+      when: http_host is defined
+
+    - name: Reload Apache
+      when: http_host is defined
+      service:
+        name: apache2
+        state: reloaded
+      notify: restart-apache
